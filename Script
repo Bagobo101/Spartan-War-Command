@@ -1,0 +1,314 @@
+// ==UserScript==
+// @name         Spartan War Command OPTIMIZED (Testing Phase)
+// @namespace    torn.war.intel
+// @version      Testing Phase
+// @description Spartan War Command is a real-time tactical intelligence overlay for Torn Faction ranked wars. It automatically detects enemy faction members, tracks hospital status and cooldown timers, and provides a streamlined command interface with search, priority marking, and one-tap clipboard callouts for rapid faction coordination. Designed for mobile PDA use with optimized performance, adaptive polling, and lightweight UI rendering.
+// @match        https://www.torn.com/factions.php*
+// @run-at       document-end
+// ==/UserScript==
+
+(function () {
+    const API_KEY = "YOUR_API_KEY_HERE";
+    const STORAGE_KEY = "spartan_war_v1";
+
+    // ================= STATE =================
+    let state = {
+        x: 10,
+        y: 80,
+        compact: false,
+        priority: []
+    };
+
+    let enemyRoster = {};
+    let cache = new Map(); // last known user states
+    let warActive = false;
+    let search = "";
+
+    let loopTimer = null;
+    let fastMode = false;
+
+    let panel;
+
+    // ================= LOAD STATE =================
+    function loadState() {
+        try {
+            const s = JSON.parse(localStorage.getItem(STORAGE_KEY));
+            if (s) state = { ...state, ...s };
+        } catch {}
+    }
+
+    function saveState() {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+    }
+
+    // ================= UTIL =================
+    const now = () => Math.floor(Date.now() / 1000);
+
+    function fmt(sec) {
+        sec = Math.max(0, sec);
+        return `${Math.floor(sec / 60)}:${(sec % 60).toString().padStart(2, "0")}`;
+    }
+
+    function copy(text) {
+        navigator.clipboard?.writeText(text).catch(() => {
+            const ta = document.createElement("textarea");
+            ta.value = text;
+            document.body.appendChild(ta);
+            ta.select();
+            document.execCommand("copy");
+            ta.remove();
+        });
+    }
+
+    // ================= UI CLEANUP =================
+    function killOld() {
+        document.getElementById("warIntel")?.remove();
+    }
+
+    // ================= BUILD UI =================
+    function buildUI() {
+        panel = document.createElement("div");
+        panel.id = "warIntel";
+
+        Object.assign(panel.style, {
+            position: "fixed",
+            top: state.y + "px",
+            left: state.x + "px",
+            width: "270px",
+            background: "#0f0f0f",
+            color: "#fff",
+            border: "1px solid #333",
+            borderRadius: "8px",
+            padding: "6px",
+            zIndex: 999999,
+            fontSize: "10px",
+            fontFamily: "Arial",
+            userSelect: "none",
+            touchAction: "none"
+        });
+
+        panel.innerHTML = `
+            <div style="display:flex;gap:6px;align-items:center;margin-bottom:6px;">
+                <div id="drag" style="width:44px;height:44px;background:#333;border-radius:8px;
+                    display:flex;align-items:center;justify-content:center;font-size:18px;cursor:grab;">⋮⋮</div>
+
+                <div id="toggle" style="width:44px;height:44px;background:#222;border-radius:8px;
+                    display:flex;align-items:center;justify-content:center;font-size:16px;cursor:pointer;">▣</div>
+
+                <div style="flex:1;text-align:center;font-weight:bold;background:#111;padding:6px;border-radius:6px;">
+                    WAR INTEL
+                </div>
+            </div>
+
+            <input id="search" placeholder="Search..."
+                style="width:85%;padding:4px;font-size:9px;margin-bottom:6px;border-radius:4px;border:none;">
+
+            <div id="list"></div>
+        `;
+
+        document.body.appendChild(panel);
+        bindUI();
+        applyState();
+    }
+
+    function applyState() {
+        panel.style.left = state.x + "px";
+        panel.style.top = state.y + "px";
+        setCompact(state.compact);
+    }
+
+    // ================= COMPACT =================
+    function setCompact(v) {
+        const list = document.getElementById("list");
+        const searchBox = document.getElementById("search");
+        const drag = document.getElementById("drag");
+        const toggle = document.getElementById("toggle");
+
+        state.compact = v;
+
+        if (v) {
+            list.style.display = "none";
+            searchBox.style.display = "none";
+            panel.style.width = "70px";
+
+            drag.style.width = toggle.style.width = "52px";
+            drag.style.height = toggle.style.height = "52px";
+        } else {
+            list.style.display = "block";
+            searchBox.style.display = "block";
+            panel.style.width = "270px";
+
+            drag.style.width = toggle.style.width = "44px";
+            drag.style.height = toggle.style.height = "44px";
+        }
+    }
+
+    // ================= EVENTS =================
+    function bindUI() {
+        const searchBox = document.getElementById("search");
+        const drag = document.getElementById("drag");
+        const toggle = document.getElementById("toggle");
+
+        searchBox.oninput = e => search = e.target.value.toLowerCase();
+
+        toggle.onclick = () => {
+            setCompact(!state.compact);
+            saveState();
+        };
+
+        let dragging = false, ox = 0, oy = 0;
+
+        drag.onpointerdown = e => {
+            dragging = true;
+            const r = panel.getBoundingClientRect();
+            ox = e.clientX - r.left;
+            oy = e.clientY - r.top;
+            panel.setPointerCapture(e.pointerId);
+        };
+
+        panel.onpointermove = e => {
+            if (!dragging) return;
+            state.x = e.clientX - ox;
+            state.y = e.clientY - oy;
+            panel.style.left = state.x + "px";
+            panel.style.top = state.y + "px";
+        };
+
+        panel.onpointerup = () => {
+            dragging = false;
+            saveState();
+        };
+
+        panel.onpointercancel = () => dragging = false;
+    }
+
+    // ================= WAR FETCH (OPTIMIZED) =================
+    async function loadWar() {
+        try {
+            const res = await fetch(`https://api.torn.com/faction/?selections=rankedwars&key=${API_KEY}`);
+            const data = await res.json();
+
+            warActive = false;
+            enemyRoster = {};
+
+            if (!data?.rankedwar) return;
+
+            const f = data.rankedwar.factions;
+            const myId = data.rankedwar.faction_id || f.attacking_faction.id;
+
+            const enemyId =
+                f.attacking_faction.id === myId
+                    ? f.defending_faction.id
+                    : f.attacking_faction.id;
+
+            const r = await fetch(`https://api.torn.com/faction/${enemyId}?selections=basic&key=${API_KEY}`);
+            const d = await r.json();
+
+            enemyRoster = d.members || {};
+            warActive = true;
+
+        } catch {
+            warActive = false;
+        }
+    }
+
+    // ================= OPTIMIZED RENDER =================
+    async function render() {
+        const list = document.getElementById("list");
+        if (!list) return;
+
+        if (!warActive) {
+            list.innerHTML = `<div style="color:#aaa;">No active war</div>`;
+            return;
+        }
+
+        const t = now();
+        const output = [];
+
+        const ids = Object.keys(enemyRoster);
+
+        for (const id of ids) {
+            const name = enemyRoster[id].name;
+
+            if (search && !name.toLowerCase().includes(search)) continue;
+
+            let cached = cache.get(id);
+
+            // 🔥 ONLY FETCH IF MISSING OR EXPIRED (60s cache)
+            if (!cached || t - cached.lastFetch > 60) {
+                try {
+                    const r = await fetch(`https://api.torn.com/user/${id}?selections=profile&key=${API_KEY}`);
+                    const d = await r.json();
+
+                    if (!d.status) continue;
+
+                    cached = {
+                        name,
+                        until: d.status.until,
+                        state: d.status.state,
+                        lastFetch: t
+                    };
+
+                    cache.set(id, cached);
+                } catch {
+                    continue;
+                }
+            }
+
+            if (cached.state !== "Hospital") continue;
+
+            const time = cached.until - t;
+            if (time <= 0) continue;
+
+            output.push({ id, name, time });
+        }
+
+        // ⚡ SORT FASTEST FIRST
+        output.sort((a, b) => a.time - b.time);
+
+        list.innerHTML = output.length
+            ? output.map(o => `
+                <div style="margin-bottom:6px;">
+                    <div style="display:flex;justify-content:space-between;">
+                        <div>${o.name}</div>
+                        <button data-call="${o.id}">CALL</button>
+                    </div>
+                    <div>${fmt(o.time)}</div>
+                </div>
+            `).join("")
+            : `<div style="color:#aaa;">No targets</div>`;
+    }
+
+    // ================= CALL =================
+    document.addEventListener("click", e => {
+        const id = e.target.dataset.call;
+        if (!id) return;
+
+        const data = cache.get(id);
+        if (!data) return;
+
+        copy(`${data.name} | ${fmt(data.until - now())}`);
+    });
+
+    // ================= ADAPTIVE LOOP =================
+    async function loop() {
+        await loadWar();
+
+        fastMode = Object.values(cache).some(c =>
+            c && (c.until - now()) < 360
+        );
+
+        await render();
+
+        const delay = fastMode ? 2500 : 6000;
+
+        loopTimer = setTimeout(loop, delay);
+    }
+
+    // ================= INIT =================
+    loadState();
+    killOld();
+    buildUI();
+    loop();
+
+})();
