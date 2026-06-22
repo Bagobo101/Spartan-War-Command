@@ -1,0 +1,272 @@
+// ==UserScript==
+// @author       Bagobo
+// @name         Spartan War Command v17.1
+// @namespace    torn.war.intel
+// @version      17.1
+// @description  Stable war intel system (fixed toggle + PDA UI persistence)
+// @match        https://www.torn.com/factions.php*
+// @run-at       document-end
+// ==/UserScript==
+
+(function () {
+
+    // ================= API =================
+    const API_KEY_STORAGE = "spartan_api_key";
+    const STATE_KEY = "spartan_state_v17";
+
+    const getKey = () => localStorage.getItem(API_KEY_STORAGE) || "";
+    const setKey = (k) => localStorage.setItem(API_KEY_STORAGE, k.trim());
+
+    let API_KEY = getKey();
+
+    // ================= STATE =================
+    let state = {
+        x: 20,
+        y: 80,
+        compact: false
+    };
+
+    let enemyRoster = {};
+    let cache = {};
+    let search = "";
+    let warActive = false;
+
+    const now = () => Math.floor(Date.now() / 1000);
+
+    function fmt(t) {
+        t = Math.max(0, t);
+        return `${Math.floor(t / 60)}:${(t % 60).toString().padStart(2, "0")}`;
+    }
+
+    function copy(text) {
+        navigator.clipboard?.writeText(text);
+    }
+
+    // ================= LOAD STATE =================
+    try {
+        const saved = JSON.parse(localStorage.getItem(STATE_KEY));
+        if (saved) state = saved;
+    } catch {}
+
+    function saveState() {
+        localStorage.setItem(STATE_KEY, JSON.stringify(state));
+    }
+
+    // ================= UI =================
+    const panel = document.createElement("div");
+
+    Object.assign(panel.style, {
+        position: "fixed",
+        top: state.y + "px",
+        left: state.x + "px",
+        width: "300px",
+        background: "#0f0f0f",
+        color: "#fff",
+        border: "1px solid #333",
+        borderRadius: "8px",
+        padding: "6px",
+        zIndex: 999999,
+        fontSize: "10px",
+        fontFamily: "Arial",
+        userSelect: "none",
+        touchAction: "none",
+        willChange: "transform,width,height",
+        contain: "layout paint"
+    });
+
+    panel.innerHTML = `
+        <div style="display:flex;gap:6px;align-items:center;margin-bottom:6px;">
+
+            <div id="drag" style="width:46px;height:46px;background:#333;border-radius:8px;
+                display:flex;align-items:center;justify-content:center;cursor:grab;">⋮⋮</div>
+
+            <div id="toggle" style="width:46px;height:46px;background:#222;border-radius:8px;
+                display:flex;align-items:center;justify-content:center;cursor:pointer;">▣</div>
+
+            <div id="settings" style="width:46px;height:46px;background:#222;border-radius:8px;
+                display:flex;align-items:center;justify-content:center;cursor:pointer;">⚙️</div>
+
+            <div style="flex:1;text-align:center;font-weight:bold;background:#111;padding:6px;border-radius:6px;">
+                SPARTAN'S WAR CALL SHOTS
+            </div>
+        </div>
+
+        <input id="search" placeholder="Search enemy..."
+            style="width:85%;padding:4px;font-size:9px;margin-bottom:6px;border:none;border-radius:4px;">
+
+        <div id="list"></div>
+    `;
+
+    document.body.appendChild(panel);
+
+    const drag = document.getElementById("drag");
+    const toggle = document.getElementById("toggle");
+    const settings = document.getElementById("settings");
+    const list = document.getElementById("list");
+    const searchBox = document.getElementById("search");
+
+    // ================= APPLY UI STATE (FIX CORE BUG) =================
+    function applyUIState() {
+
+        if (state.compact) {
+            searchBox.style.display = "none";
+            list.style.display = "none";
+
+            panel.style.width = "70px";
+            panel.style.height = "70px";
+            panel.style.overflow = "hidden";
+
+            toggle.textContent = "▢";
+
+        } else {
+            searchBox.style.display = "block";
+            list.style.display = "block";
+
+            panel.style.width = "300px";
+            panel.style.height = "auto";
+            panel.style.overflow = "visible";
+
+            toggle.textContent = "▣";
+        }
+    }
+
+    // APPLY ON LOAD (IMPORTANT FIX)
+    applyUIState();
+
+    // ================= SETTINGS =================
+    settings.onclick = () => {
+        const key = prompt("Enter Torn API Key:", getKey());
+        if (!key) return;
+        API_KEY = key.trim();
+        setKey(API_KEY);
+    };
+
+    // ================= SEARCH =================
+    searchBox.oninput = e => search = e.target.value.toLowerCase();
+
+    // ================= TOGGLE (FIXED) =================
+    toggle.onclick = () => {
+        state.compact = !state.compact;
+        applyUIState();
+        saveState();
+    };
+
+    // ================= DRAG =================
+    let dragging = false, ox = 0, oy = 0;
+
+    drag.onpointerdown = e => {
+        dragging = true;
+        const r = panel.getBoundingClientRect();
+        ox = e.clientX - r.left;
+        oy = e.clientY - r.top;
+        panel.setPointerCapture(e.pointerId);
+    };
+
+    panel.onpointermove = e => {
+        if (!dragging) return;
+
+        state.x = e.clientX - ox;
+        state.y = e.clientY - oy;
+
+        panel.style.left = state.x + "px";
+        panel.style.top = state.y + "px";
+    };
+
+    panel.onpointerup = () => {
+        dragging = false;
+        saveState();
+    };
+
+    // ================= WAR FETCH =================
+    async function loadWar() {
+        if (!API_KEY) return;
+
+        try {
+            const r = await fetch(`https://api.torn.com/faction/?selections=rankedwars&key=${API_KEY}`);
+            const d = await r.json();
+
+            warActive = false;
+            enemyRoster = {};
+
+            if (!d?.rankedwar) return;
+
+            const f = d.rankedwar.factions;
+            const myId = d.rankedwar.faction_id || f.attacking_faction.id;
+
+            const enemyId =
+                f.attacking_faction.id === myId
+                    ? f.defending_faction.id
+                    : f.attacking_faction.id;
+
+            const r2 = await fetch(`https://api.torn.com/faction/${enemyId}?selections=basic&key=${API_KEY}`);
+            const d2 = await r2.json();
+
+            enemyRoster = d2.members || {};
+            warActive = true;
+
+        } catch {}
+    }
+
+    // ================= MAIN LOOP =================
+    async function loop() {
+
+        if (!API_KEY) {
+            list.innerHTML = `<div style="color:#ff5555;text-align:center;">⚠️ SET API KEY</div>`;
+            setTimeout(loop, 3000);
+            return;
+        }
+
+        await loadWar();
+
+        const t = now();
+        const output = [];
+
+        for (const id in enemyRoster) {
+
+            const name = enemyRoster[id].name;
+            if (search && !name.toLowerCase().includes(search)) continue;
+
+            try {
+
+                if (!cache[id] || t - cache[id].t > 60) {
+                    const r = await fetch(`https://api.torn.com/user/${id}?selections=profile&key=${API_KEY}`);
+                    const d = await r.json();
+                    if (!d.status) continue;
+
+                    cache[id] = {
+                        name,
+                        until: d.status.until,
+                        state: d.status.state,
+                        t
+                    };
+                }
+
+                const c = cache[id];
+                if (c.state !== "Hospital") continue;
+
+                const time = c.until - t;
+                if (time <= 0) continue;
+
+                output.push({ id, name, time });
+
+            } catch {}
+        }
+
+        output.sort((a,b) => a.time - b.time);
+
+        list.innerHTML = output.length ? output.map(o => `
+            <div style="margin-bottom:6px;">
+                <div style="display:flex;justify-content:space-between;">
+                    <div>${o.name}</div>
+                    <button onclick="navigator.clipboard.writeText('${o.name} | ${fmt(o.time)}')">CALL</button>
+                </div>
+                <div>${fmt(o.time)}</div>
+            </div>
+        `).join("") : `<div style="color:#aaa;">No targets</div>`;
+
+        setTimeout(loop, 4000);
+    }
+
+    loop();
+
+})();
