@@ -248,19 +248,6 @@ Copy your key
 
 ---
 
-📌 Where to put the API key
-
-Inside the script, find:
-
-const API_KEY = "YOUR_API_KEY";
-
-Replace it with:
-
-const API_KEY = "1234567890YOURKEYHERE";
-
-
----
-
 ⚠️ Important notes
 
 Do NOT share your API key publicly
