@@ -1,0 +1,235 @@
+// ==UserScript==
+// @name         Spartan War Command v19 INSTANT ZERO LAG
+// @namespace    torn.war.intel
+// @version      19.0
+// @description  Instant enemy detection + zero lag UI engine
+// @match        https://www.torn.com/factions.php*
+// @run-at       document-end
+// ==/UserScript==
+
+(function () {
+
+    // ================= API =================
+    const KEY = "spartan_api_key_v19";
+    let API_KEY = localStorage.getItem(KEY) || "";
+
+    const setKey = k => localStorage.setItem(KEY, k.trim());
+
+    // ================= STATE =================
+    let roster = {};
+    let cache = {};
+    let rows = new Map();
+
+    let search = "";
+    let warActive = false;
+
+    const now = () => Math.floor(Date.now() / 1000);
+
+    const fmt = t => {
+        t = Math.max(0, t);
+        return `${Math.floor(t/60)}:${(t%60).toString().padStart(2,'0')}`;
+    };
+
+    const copy = t => navigator.clipboard?.writeText(t);
+
+    // ================= PANEL =================
+    const panel = document.createElement("div");
+
+    Object.assign(panel.style, {
+        position: "fixed",
+        top: "80px",
+        left: "20px",
+        width: "300px",
+        background: "#0f0f0f",
+        color: "#fff",
+        border: "1px solid #333",
+        borderRadius: "8px",
+        padding: "6px",
+        zIndex: 999999,
+        fontSize: "10px",
+        fontFamily: "Arial"
+    });
+
+    panel.innerHTML = `
+        <div style="display:flex;gap:6px;align-items:center;margin-bottom:6px;">
+            <div id="drag" style="width:44px;height:44px;background:#333;border-radius:8px;
+                display:flex;align-items:center;justify-content:center;cursor:grab;">⋮⋮</div>
+
+            <div style="flex:1;text-align:center;font-weight:bold;background:#111;padding:6px;border-radius:6px;">
+                SPARTAN'S WAR CRY 
+            </div>
+
+            <div id="api" style="width:44px;height:44px;background:#222;border-radius:8px;
+                display:flex;align-items:center;justify-content:center;cursor:pointer;">⚙️</div>
+        </div>
+
+        <input id="search" placeholder="Search enemy..."
+            style="width:90%;padding:4px;font-size:9px;margin-bottom:6px;border:none;border-radius:4px;">
+
+        <div id="list"></div>
+    `;
+
+    document.body.appendChild(panel);
+
+    const list = document.getElementById("list");
+    const searchBox = document.getElementById("search");
+    const apiBtn = document.getElementById("api");
+
+    // ================= API KEY =================
+    apiBtn.onclick = () => {
+        const k = prompt("API KEY:", API_KEY);
+        if (!k) return;
+        API_KEY = k.trim();
+        setKey(API_KEY);
+    };
+
+    searchBox.oninput = e => search = e.target.value.toLowerCase();
+
+    // ================= DRAG =================
+    let drag = false, ox = 0, oy = 0;
+
+    panel.onpointerdown = e => {
+        drag = true;
+        const r = panel.getBoundingClientRect();
+        ox = e.clientX - r.left;
+        oy = e.clientY - r.top;
+    };
+
+    panel.onpointermove = e => {
+        if (!drag) return;
+        panel.style.left = (e.clientX - ox) + "px";
+        panel.style.top = (e.clientY - oy) + "px";
+    };
+
+    panel.onpointerup = () => drag = false;
+
+    // ================= WAR FETCH =================
+    async function fetchWar() {
+        if (!API_KEY) return;
+
+        try {
+            const r = await fetch(`https://api.torn.com/faction/?selections=rankedwars&key=${API_KEY}`);
+            const d = await r.json();
+
+            warActive = false;
+            roster = {};
+
+            if (!d?.rankedwar) return;
+
+            const f = d.rankedwar.factions;
+            const myId = d.rankedwar.faction_id || f.attacking_faction.id;
+
+            const enemyId =
+                f.attacking_faction.id === myId
+                    ? f.defending_faction.id
+                    : f.attacking_faction.id;
+
+            const r2 = await fetch(`https://api.torn.com/faction/${enemyId}?selections=basic&key=${API_KEY}`);
+            const d2 = await r2.json();
+
+            const newRoster = d2.members || {};
+
+            // ================= INSTANT DETECTION (DIFF ENGINE) =================
+            for (const id in newRoster) {
+                if (!roster[id]) {
+                    newRoster[id]._new = true; // mark new enemy instantly
+                }
+            }
+
+            roster = newRoster;
+            warActive = true;
+
+        } catch {}
+    }
+
+    // ================= CREATE ROW (ONCE ONLY) =================
+    function createRow(id, name) {
+
+        const row = document.createElement("div");
+        row.style.marginBottom = "6px";
+
+        row.innerHTML = `
+            <div style="display:flex;justify-content:space-between;">
+                <div class="name"></div>
+                <button class="call">CALL</button>
+            </div>
+            <div class="info"></div>
+        `;
+
+        const nameEl = row.querySelector(".name");
+        const infoEl = row.querySelector(".info");
+        const btn = row.querySelector(".call");
+
+        btn.onclick = () => {
+            const c = cache[id];
+            if (!c) return;
+            copy(`${c.name} | ${fmt(c.until - now())}`);
+        };
+
+        list.appendChild(row);
+
+        rows.set(id, { row, nameEl, infoEl });
+    }
+
+    // ================= ZERO LAG RENDER LOOP =================
+    function renderLoop() {
+        const t = now();
+
+        for (const id in cache) {
+
+            const c = cache[id];
+            const r = rows.get(id);
+            if (!r) continue;
+
+            const time = c.until - t;
+
+            r.infoEl.textContent =
+                time <= 0 ? "READY"
+                : `HOSP | ${fmt(time)}`;
+
+            r.nameEl.textContent =
+                cache[id]._new ? "🆕 " + c.name : c.name;
+        }
+
+        requestAnimationFrame(renderLoop);
+    }
+
+    // ================= DETECTION LOOP =================
+    async function loop() {
+
+        await fetchWar();
+
+        const t = now();
+
+        for (const id in roster) {
+
+            const name = roster[id].name;
+
+            if (search && !name.toLowerCase().includes(search)) continue;
+
+            if (!cache[id] || t - cache[id].t > 60) {
+                try {
+                    const r = await fetch(`https://api.torn.com/user/${id}?selections=profile&key=${API_KEY}`);
+                    const d = await r.json();
+
+                    if (!d.status) continue;
+
+                    cache[id] = {
+                        name,
+                        until: d.status.until,
+                        t
+                    };
+
+                    if (!rows.has(id)) createRow(id, name);
+
+                } catch {}
+            }
+        }
+
+        setTimeout(loop, 3500);
+    }
+
+    loop();
+    renderLoop();
+
+})();
