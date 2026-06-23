@@ -255,6 +255,7 @@ Copy your key
 Do NOT share your API key publicly
 
 If API key is wrong → no war data will load
+Use Limited Key
 
 Script only works during:
 
