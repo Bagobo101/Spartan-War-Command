@@ -1,5 +1,5 @@
 update:
-https://github.com/Bagobo101/Spartan-War-Command/blob/main/Spartan%20War%20Command%20v17.1
+https://github.com/Bagobo101/Spartan-War-Command/blob/main/Spartan%20War%20Cry
 ---
 
 ⚔️ SPARTAN WAR COMMAND (WAR INTEL SYSTEM)
